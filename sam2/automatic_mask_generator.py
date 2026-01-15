@@ -37,6 +37,54 @@ class SAM2AutomaticMaskGenerator:
     def __init__(
         self,
         model: SAM2Base,
+        min_mask_region_area: int = 0,
+        max_sprinkle_area: int = 0,
+        **kwargs,
+    ) -> None:
+        """
+        Using a SAM 2 model, generates masks for the entire image.
+        Generates a grid of point prompts over the image, then filters
+        low quality and duplicate masks. The default settings are chosen
+        for SAM 2 with a HieraL backbone.
+
+        Arguments:
+          model (Sam): The SAM 2 model to use for mask prediction.
+          min_mask_region_area (int): If >0, postprocessing will be applied
+            to remove disconnected regions and holes in masks with area smaller
+            than min_mask_region_area. Requires opencv.
+
+        """
+
+        self.predictor = SAM2ImagePredictor(
+            model,
+            max_hole_area=min_mask_region_area,
+            max_sprinkle_area=max_sprinkle_area,
+        )
+        self.min_mask_region_area = min_mask_region_area
+        self.max_sprinkle_area = max_sprinkle_area
+        self.kwargs = kwargs
+
+    @classmethod
+    def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2AutomaticMaskGenerator":
+        """
+        Load a pretrained model from the Hugging Face hub.
+
+        Arguments:
+          model_id (str): The Hugging Face repository ID.
+          **kwargs: Additional arguments to pass to the model constructor.
+
+        Returns:
+          (SAM2AutomaticMaskGenerator): The loaded model.
+        """
+        from sam2.build_sam import build_sam2_hf
+
+        sam_model = build_sam2_hf(model_id, **kwargs)
+        return cls(sam_model, **kwargs)
+
+    @torch.no_grad()
+    def generate(
+        self,
+        image: np.ndarray,
         points_per_side: Optional[int] = 32,
         points_per_batch: int = 64,
         pred_iou_thresh: float = 0.8,
@@ -49,20 +97,15 @@ class SAM2AutomaticMaskGenerator:
         crop_overlap_ratio: float = 512 / 1500,
         crop_n_points_downscale_factor: int = 1,
         point_grids: Optional[List[np.ndarray]] = None,
-        min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
         use_m2m: bool = False,
         multimask_output: bool = True,
-        **kwargs,
-    ) -> None:
+    ) -> List[Dict[str, Any]]:
         """
-        Using a SAM 2 model, generates masks for the entire image.
-        Generates a grid of point prompts over the image, then filters
-        low quality and duplicate masks. The default settings are chosen
-        for SAM 2 with a HieraL backbone.
+        Generates masks for the given image.
 
         Arguments:
-          model (Sam): The SAM 2 model to use for mask prediction.
+          image (np.ndarray): The image to generate masks for, in HWC uint8 format.
           points_per_side (int or None): The number of points to be sampled
             along one side of the image. The total number of points is
             points_per_side**2. If None, 'point_grids' must provide explicit
@@ -92,87 +135,12 @@ class SAM2AutomaticMaskGenerator:
           point_grids (list(np.ndarray) or None): A list over explicit grids
             of points used for sampling, normalized to [0,1]. The nth grid in the
             list is used in the nth crop layer. Exclusive with points_per_side.
-          min_mask_region_area (int): If >0, postprocessing will be applied
-            to remove disconnected regions and holes in masks with area smaller
-            than min_mask_region_area. Requires opencv.
           output_mode (str): The form masks are returned in. Can be 'binary_mask',
             'uncompressed_rle', or 'coco_rle'. 'coco_rle' requires pycocotools.
             For large resolutions, 'binary_mask' may consume large amounts of
             memory.
           use_m2m (bool): Whether to add a one step refinement using previous mask predictions.
           multimask_output (bool): Whether to output multimask at each point of the grid.
-        """
-
-        assert (points_per_side is None) != (
-            point_grids is None
-        ), "Exactly one of points_per_side or point_grid must be provided."
-        if points_per_side is not None:
-            self.point_grids = build_all_layer_point_grids(
-                points_per_side,
-                crop_n_layers,
-                crop_n_points_downscale_factor,
-            )
-        elif point_grids is not None:
-            self.point_grids = point_grids
-        else:
-            raise ValueError("Can't have both points_per_side and point_grid be None.")
-
-        assert output_mode in [
-            "binary_mask",
-            "uncompressed_rle",
-            "coco_rle",
-        ], f"Unknown output_mode {output_mode}."
-        if output_mode == "coco_rle":
-            try:
-                from pycocotools import mask as mask_utils  # type: ignore  # noqa: F401
-            except ImportError as e:
-                print("Please install pycocotools")
-                raise e
-
-        self.predictor = SAM2ImagePredictor(
-            model,
-            max_hole_area=min_mask_region_area,
-            max_sprinkle_area=min_mask_region_area,
-        )
-        self.points_per_batch = points_per_batch
-        self.pred_iou_thresh = pred_iou_thresh
-        self.stability_score_thresh = stability_score_thresh
-        self.stability_score_offset = stability_score_offset
-        self.mask_threshold = mask_threshold
-        self.box_nms_thresh = box_nms_thresh
-        self.crop_n_layers = crop_n_layers
-        self.crop_nms_thresh = crop_nms_thresh
-        self.crop_overlap_ratio = crop_overlap_ratio
-        self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
-        self.min_mask_region_area = min_mask_region_area
-        self.output_mode = output_mode
-        self.use_m2m = use_m2m
-        self.multimask_output = multimask_output
-
-    @classmethod
-    def from_pretrained(cls, model_id: str, **kwargs) -> "SAM2AutomaticMaskGenerator":
-        """
-        Load a pretrained model from the Hugging Face hub.
-
-        Arguments:
-          model_id (str): The Hugging Face repository ID.
-          **kwargs: Additional arguments to pass to the model constructor.
-
-        Returns:
-          (SAM2AutomaticMaskGenerator): The loaded model.
-        """
-        from sam2.build_sam import build_sam2_hf
-
-        sam_model = build_sam2_hf(model_id, **kwargs)
-        return cls(sam_model, **kwargs)
-
-    @torch.no_grad()
-    def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
-        """
-        Generates masks for the given image.
-
-        Arguments:
-          image (np.ndarray): The image to generate masks for, in HWC uint8 format.
 
         Returns:
            list(dict(str, any)): A list over records for masks. Each record is
@@ -191,16 +159,53 @@ class SAM2AutomaticMaskGenerator:
                crop_box (list(float)): The crop of the image used to generate
                  the mask, given in XYWH format.
         """
+        assert (points_per_side is None) != (
+            point_grids is None
+        ), "Exactly one of points_per_side or point_grid must be provided."
+        if points_per_side is not None:
+            point_grids = build_all_layer_point_grids(
+                points_per_side,
+                crop_n_layers,
+                crop_n_points_downscale_factor,
+            )
+        elif point_grids is None:
+            raise ValueError("Can't have both points_per_side and point_grid be None.")
+
+        assert output_mode in [
+            "binary_mask",
+            "uncompressed_rle",
+            "coco_rle",
+        ], f"Unknown output_mode {output_mode}."
+        if output_mode == "coco_rle":
+            try:
+                from pycocotools import mask as mask_utils  # type: ignore  # noqa: F401
+            except ImportError as e:
+                print("Please install pycocotools")
+                raise e
 
         # Generate masks
-        mask_data = self._generate_masks(image)
+        mask_data = self._generate_masks(
+            image,
+            point_grids=point_grids,
+            crop_n_layers=crop_n_layers,
+            crop_overlap_ratio=crop_overlap_ratio,
+            crop_nms_thresh=crop_nms_thresh,
+            points_per_batch=points_per_batch,
+            pred_iou_thresh=pred_iou_thresh,
+            stability_score_thresh=stability_score_thresh,
+            stability_score_offset=stability_score_offset,
+            mask_threshold=mask_threshold,
+            box_nms_thresh=box_nms_thresh,
+            use_m2m=use_m2m,
+            multimask_output=multimask_output,
+        )
 
         # Encode masks
-        if self.output_mode == "coco_rle":
+        if output_mode == "coco_rle":
             mask_data["segmentations"] = [
                 coco_encode_rle(rle) for rle in mask_data["rles"]
             ]
-        elif self.output_mode == "binary_mask":
+        elif output_mode == "binary_mask":
             mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
             mask_data["segmentations"] = mask_data["rles"]
@@ -221,16 +226,45 @@ class SAM2AutomaticMaskGenerator:
 
         return curr_anns
 
-    def _generate_masks(self, image: np.ndarray) -> MaskData:
+    def _generate_masks(
+        self,
+        image: np.ndarray,
+        point_grids: List[np.ndarray],
+        crop_n_layers: int,
+        crop_overlap_ratio: float,
+        crop_nms_thresh: float,
+        points_per_batch: int,
+        pred_iou_thresh: float,
+        stability_score_thresh: float,
+        stability_score_offset: float,
+        mask_threshold: float,
+        box_nms_thresh: float,
+        use_m2m: bool,
+        multimask_output: bool,
+    ) -> MaskData:
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
-            orig_size, self.crop_n_layers, self.crop_overlap_ratio
+            orig_size, crop_n_layers, crop_overlap_ratio
         )
 
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
+            crop_data = self._process_crop(
+                image,
+                crop_box,
+                layer_idx,
+                orig_size,
+                point_grids=point_grids,
+                points_per_batch=points_per_batch,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                stability_score_offset=stability_score_offset,
+                mask_threshold=mask_threshold,
+                box_nms_thresh=box_nms_thresh,
+                use_m2m=use_m2m,
+                multimask_output=multimask_output,
+            )
             data.cat(crop_data)
 
         # Remove duplicate masks between crops
@@ -242,7 +276,7 @@ class SAM2AutomaticMaskGenerator:
                 data["boxes"].float(),
                 scores,
                 torch.zeros_like(data["boxes"][:, 0]),  # categories
-                iou_threshold=self.crop_nms_thresh,
+                iou_threshold=crop_nms_thresh,
             )
             data.filter(keep_by_nms)
         data.to_numpy()
@@ -254,6 +288,15 @@ class SAM2AutomaticMaskGenerator:
         crop_box: List[int],
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
+        point_grids: List[np.ndarray],
+        points_per_batch: int,
+        pred_iou_thresh: float,
+        stability_score_thresh: float,
+        stability_score_offset: float,
+        mask_threshold: float,
+        box_nms_thresh: float,
+        use_m2m: bool,
+        multimask_output: bool,
     ) -> MaskData:
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
@@ -263,13 +306,24 @@ class SAM2AutomaticMaskGenerator:
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
-        points_for_image = self.point_grids[crop_layer_idx] * points_scale
+        points_for_image = point_grids[crop_layer_idx] * points_scale
 
         # Generate masks for this crop in batches
         data = MaskData()
-        for (points,) in batch_iterator(self.points_per_batch, points_for_image):
+        for (points,) in batch_iterator(points_per_batch, points_for_image):
             batch_data = self._process_batch(
-                points, cropped_im_size, crop_box, orig_size, normalize=True
+                points,
+                cropped_im_size,
+                crop_box,
+                orig_size,
+                normalize=True,
+                points_per_batch=points_per_batch,
+                pred_iou_thresh=pred_iou_thresh,
+                stability_score_thresh=stability_score_thresh,
+                stability_score_offset=stability_score_offset,
+                mask_threshold=mask_threshold,
+                use_m2m=use_m2m,
+                multimask_output=multimask_output,
             )
             data.cat(batch_data)
             del batch_data
@@ -280,7 +334,7 @@ class SAM2AutomaticMaskGenerator:
             data["boxes"].float(),
             data["iou_preds"],
             torch.zeros_like(data["boxes"][:, 0]),  # categories
-            iou_threshold=self.box_nms_thresh,
+            iou_threshold=box_nms_thresh,
         )
         data.filter(keep_by_nms)
 
@@ -297,6 +351,13 @@ class SAM2AutomaticMaskGenerator:
         im_size: Tuple[int, ...],
         crop_box: List[int],
         orig_size: Tuple[int, ...],
+        points_per_batch: int,
+        pred_iou_thresh: float,
+        stability_score_thresh: float,
+        stability_score_offset: float,
+        mask_threshold: float,
+        use_m2m: bool,
+        multimask_output: bool,
         normalize=False,
     ) -> MaskData:
         orig_h, orig_w = orig_size
@@ -314,7 +375,7 @@ class SAM2AutomaticMaskGenerator:
         masks, iou_preds, low_res_masks = self.predictor._predict(
             in_points[:, None, :],
             in_labels[:, None],
-            multimask_output=self.multimask_output,
+            multimask_output=multimask_output,
             return_logits=True,
         )
 
@@ -327,18 +388,18 @@ class SAM2AutomaticMaskGenerator:
         )
         del masks
 
-        if not self.use_m2m:
+        if not use_m2m:
             # Filter by predicted IoU
-            if self.pred_iou_thresh > 0.0:
-                keep_mask = data["iou_preds"] > self.pred_iou_thresh
+            if pred_iou_thresh > 0.0:
+                keep_mask = data["iou_preds"] > pred_iou_thresh
                 data.filter(keep_mask)
 
             # Calculate and filter by stability score
             data["stability_score"] = calculate_stability_score(
-                data["masks"], self.mask_threshold, self.stability_score_offset
+                data["masks"], mask_threshold, stability_score_offset
             )
-            if self.stability_score_thresh > 0.0:
-                keep_mask = data["stability_score"] >= self.stability_score_thresh
+            if stability_score_thresh > 0.0:
+                keep_mask = data["stability_score"] >= stability_score_thresh
                 data.filter(keep_mask)
         else:
             # One step refinement using previous mask predictions
@@ -349,24 +410,24 @@ class SAM2AutomaticMaskGenerator:
                 in_points.shape[0], dtype=torch.int, device=in_points.device
             )
             masks, ious = self.refine_with_m2m(
-                in_points, labels, data["low_res_masks"], self.points_per_batch
+                in_points, labels, data["low_res_masks"], points_per_batch
             )
             data["masks"] = masks.squeeze(1)
             data["iou_preds"] = ious.squeeze(1)
 
-            if self.pred_iou_thresh > 0.0:
-                keep_mask = data["iou_preds"] > self.pred_iou_thresh
+            if pred_iou_thresh > 0.0:
+                keep_mask = data["iou_preds"] > pred_iou_thresh
                 data.filter(keep_mask)
 
             data["stability_score"] = calculate_stability_score(
-                data["masks"], self.mask_threshold, self.stability_score_offset
+                data["masks"], mask_threshold, stability_score_offset
             )
-            if self.stability_score_thresh > 0.0:
-                keep_mask = data["stability_score"] >= self.stability_score_thresh
+            if stability_score_thresh > 0.0:
+                keep_mask = data["stability_score"] >= stability_score_thresh
                 data.filter(keep_mask)
 
         # Threshold masks and calculate boxes
-        data["masks"] = data["masks"] > self.mask_threshold
+        data["masks"] = data["masks"] > mask_threshold
         data["boxes"] = batched_mask_to_box(data["masks"])
 
         # Filter boxes that touch crop boundaries
